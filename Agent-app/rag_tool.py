@@ -1,56 +1,22 @@
 """
-===========================================================
-RAG KNOWLEDGE BASE FOR FINANCIAL STRESS ANALYSIS
-===========================================================
+IMF PDF RAG + historical-events index (shared Qdrant under data/qdrant/).
 
-This script:
+Exports:
+  search_financial_stress_knowledge — LangChain tool for the agent
+  historical_vector_store — used by news_tool for cosine similarity
 
-1. Loads an IMF PDF report
-2. Splits the text into chunks
-3. Converts chunks into embeddings
-4. Stores embeddings inside Qdrant
-5. Creates a retriever for semantic search
-6. Exposes a LangChain tool for agents
-
------------------------------------------------------------
-WHAT IS RAG?
------------------------------------------------------------
-
-RAG = Retrieval-Augmented Generation
-
-Instead of relying only on LLM memory, we:
-- retrieve relevant documents
-- provide them to the LLM
-- generate grounded answers
-
------------------------------------------------------------
-PIPELINE
------------------------------------------------------------
-
-PDF Report
-    ↓
-Document Loading
-    ↓
-Text Chunking
-    ↓
-Embeddings
-    ↓
-Qdrant Vector Database
-    ↓
-Retriever
-    ↓
-LangChain Tool
-
-===========================================================
+If ./data/qdrant already contains points for a collection, that collection is reused:
+no PDF reload/split, no CSV→document build, and no re-embedding into Qdrant for that index.
 """
 
-# =========================================================
-# IMPORTS
-# =========================================================
+from __future__ import annotations
 
+import csv
 from pathlib import Path
 
+from dotenv import load_dotenv
 from langchain_community.document_loaders import PyPDFLoader
+from langchain_core.documents import Document
 from langchain_core.tools import tool
 from langchain_openai import OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
@@ -58,137 +24,177 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
 
-# =========================================================
-# PDF FILE CONFIGURATION (relative to this package directory)
-# =========================================================
+BASE_DIR = Path(__file__).resolve().parent
+PDF_PATH = BASE_DIR / "data" / "imf-report.pdf"
+HISTORICAL_CSV = BASE_DIR / "data" / "historical-events.csv"
+QDRANT_PATH = BASE_DIR / "data" / "qdrant"
 
-_RAG_DIR = Path(__file__).resolve().parent
-PDF_PATH = _RAG_DIR / "data" / "imf-report.pdf"
-if not PDF_PATH.is_file():
-    raise FileNotFoundError(
-        "Missing IMF corpus PDF. Place imf-report.pdf at:\n"
-        f"  {PDF_PATH}\n"
-        "(Paths are resolved from rag_tool.py location, not the shell cwd.)"
-    )
+IMF_COLLECTION = "imf_knowledge_base"
+HISTORICAL_COLLECTION = "historical_event_analogs"
 
-print("\nLoading IMF report...\n")
+CHUNK_SIZE = 1200
+CHUNK_OVERLAP = 150
+EMBEDDING_MODEL = "text-embedding-3-small"
 
-# =========================================================
-# STEP 1: LOAD PDF DOCUMENTS
-# =========================================================
+load_dotenv(BASE_DIR / ".env")
+load_dotenv()
 
-loader = PyPDFLoader(str(PDF_PATH))
-documents = loader.load()
-print(f"Loaded {len(documents)} PDF pages")
-total_characters = sum(len(doc.page_content) for doc in documents)
-print(f"Total characters: {total_characters:,}")
+QDRANT_PATH.mkdir(parents=True, exist_ok=True)
+_qdrant_client = QdrantClient(path=str(QDRANT_PATH))
+embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
+_embed_dim = len(embeddings.embed_query("financial stress"))
+print(f"Embedding dim: {_embed_dim}")
 
-# =========================================================
-# STEP 2: SPLIT DOCUMENTS INTO CHUNKS
-# =========================================================
 
-text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=1400,
-    chunk_overlap=200,
-)
-chunk_docs = text_splitter.split_documents(documents)
-print(f"\nCreated {len(chunk_docs)} chunks")
-print("\nSample Chunk")
-print("-" * 60)
-print(chunk_docs[0].page_content[:300] + "...")
+def _ensure_collection(name: str) -> None:
+    try:
+        _qdrant_client.get_collection(name)
+    except Exception:
+        _qdrant_client.create_collection(
+            collection_name=name,
+            vectors_config=VectorParams(size=_embed_dim, distance=Distance.COSINE),
+        )
 
-# =========================================================
-# STEP 3–4: EMBEDDINGS AND VECTOR DIMENSION
-# =========================================================
 
-embedding_model = OpenAIEmbeddings(model="text-embedding-3-small")
-sample_embedding = embedding_model.embed_query("financial stress")
-embedding_dimension = len(sample_embedding)
-print(f"\nEmbedding Dimension: {embedding_dimension}")
+def _points(name: str) -> int:
+    try:
+        return int(_qdrant_client.get_collection(name).points_count)
+    except Exception:
+        return 0
 
-# =========================================================
-# STEP 5–7: QDRANT, VECTOR STORE, INDEX CHUNKS
-# =========================================================
 
-qdrant_client = QdrantClient(":memory:")
-collection_name = "financial_stress_knowledge_base"
-qdrant_client.create_collection(
-    collection_name=collection_name,
-    vectors_config=VectorParams(
-        size=embedding_dimension,
-        distance=Distance.COSINE,
-    ),
-)
-print(f"\nCreated Qdrant Collection:\n{collection_name}")
+_ensure_collection(IMF_COLLECTION)
+_ensure_collection(HISTORICAL_COLLECTION)
 
 vector_store = QdrantVectorStore(
-    client=qdrant_client,
-    collection_name=collection_name,
-    embedding=embedding_model,
+    client=_qdrant_client,
+    collection_name=IMF_COLLECTION,
+    embedding=embeddings,
 )
-vector_store.add_documents(chunk_docs)
-print(f"\nAdded {len(chunk_docs)} chunks to vector database")
 
-# =========================================================
-# STEP 8: RETRIEVER (k=5)
-# =========================================================
+if _points(IMF_COLLECTION) == 0:
+    if not PDF_PATH.is_file():
+        raise FileNotFoundError(f"Missing PDF (required for first-time IMF index): {PDF_PATH}")
+    print("\nLoading IMF PDF (first-time index)…")
+    loader = PyPDFLoader(str(PDF_PATH))
+    pdf_pages = loader.load()
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+    )
+    imf_chunks = splitter.split_documents(pdf_pages)
+    print(f"Indexing {len(imf_chunks)} IMF chunks into Qdrant…")
+    vector_store.add_documents(imf_chunks)
+    print("IMF index ready.")
+else:
+    print(
+        f"Reusing IMF Qdrant index ({_points(IMF_COLLECTION)} points); "
+        "skipped PDF load, split, and re-index."
+    )
 
-retriever = vector_store.as_retriever(search_kwargs={"k": 6})
-print("\nRetriever created")
+retriever = vector_store.as_retriever(search_kwargs={"k": 5})
 
-# =========================================================
-# LANGCHAIN TOOL
-# =========================================================
+
+def _strip(row: dict[str, str]) -> dict[str, str]:
+    return {(k or "").strip(): (v or "").strip() for k, v in row.items()}
+
+
+def _historical_documents() -> list[Document]:
+    docs: list[Document] = []
+    with HISTORICAL_CSV.open(newline="", encoding="utf-8") as fh:
+        for raw in csv.DictReader(fh):
+            row = _strip(raw)
+            if not any(row.values()):
+                continue
+            event = row.get("Historical Event", "")
+            shock = row.get("Shock/Event Description", "")
+            quant = row.get("Quantitative Relationship Extracted", "")
+            market = row.get("Market Impact", "")
+            economic = row.get("Economic Impact", "")
+            transmission = row.get("Transmission Mechanism", "")
+            url = row.get("URL", "")
+            display = "\n".join(
+                [
+                    f"Historical Event: {event}",
+                    f"Headline: {row.get('Headline', '')}",
+                    f"URL: {url}",
+                    f"Shock/Event Description: {shock}",
+                    f"Quantitative Relationship Extracted: {quant}",
+                    f"Market Impact: {market}",
+                    f"Economic Impact: {economic}",
+                    f"Transmission Mechanism: {transmission}",
+                    f"Estimated Confidence: {row.get('Estimated Confidence', '')}",
+                ]
+            )
+            embed_text = "\n".join(
+                [
+                    f"Economic Impact: {economic}",
+                    f"Market Impact: {market}",
+                    f"Transmission Mechanism: {transmission}",
+                    f"Quantitative Relationship Extracted: {quant}",
+                    f"Shock / event context: {shock}",
+                ]
+            )
+            docs.append(
+                Document(
+                    page_content=embed_text,
+                    metadata={
+                        "historical_event": event,
+                        "url": url,
+                        "transmission_mechanism": transmission,
+                        "market_impact": market,
+                        "economic_impact": economic,
+                        "display_content": display,
+                    },
+                )
+            )
+    return docs
+
+
+historical_vector_store = QdrantVectorStore(
+    client=_qdrant_client,
+    collection_name=HISTORICAL_COLLECTION,
+    embedding=embeddings,
+)
+
+if _points(HISTORICAL_COLLECTION) == 0:
+    if not HISTORICAL_CSV.is_file():
+        raise FileNotFoundError(
+            f"Missing historical CSV (required for first-time historical index): {HISTORICAL_CSV}"
+        )
+    hist_docs = _historical_documents()
+    print(f"Indexing {len(hist_docs)} historical rows into Qdrant…")
+    historical_vector_store.add_documents(hist_docs)
+    print("Historical index ready.")
+else:
+    print(
+        f"Reusing historical Qdrant index ({_points(HISTORICAL_COLLECTION)} points); "
+        "skipped CSV document build and re-index."
+    )
+
+print("RAG + historical index ready.\n")
 
 
 @tool
 def search_financial_stress_knowledge(query: str) -> str:
-    """
-    Search the financial stress knowledge base.
-
-    Use this tool for:
-    - banking crises
-    - financial instability
-    - liquidity risk
-    - systemic risk
-    - recession signals
-    - economic vulnerability
-    - market fragility
-
-    Args:
-        query: Search query related to financial risk
-
-    Returns:
-        Formatted retrieval results with citations
-    """
+    """Search the IMF financial-stress knowledge base (PDF chunks)."""
     results = retriever.invoke(query)
     if not results:
-        return "No relevant information found in the knowledge base."
-    formatted_results = []
+        return "No relevant information found."
+    blocks = []
     for index, doc in enumerate(results, start=1):
         page = doc.metadata.get("page")
-        source = doc.metadata.get("source") or str(PDF_PATH.resolve())
-        location = f" (Page {page + 1})" if page is not None else ""
-        page_fragment = f"#page={page + 1}" if page is not None else ""
-        citation_url = f"file://{Path(source).resolve()}{page_fragment}"
-        formatted_text = f"""
-[Source {index}{location}]
-
-Citation:
-{citation_url}
-
-Content:
-{doc.page_content}
-"""
-        formatted_results.append(formatted_text.strip())
-    return "\n\n".join(formatted_results)
-
-
-# =========================================================
-# FINAL LOGGING
-# =========================================================
-
-print("\nTool Successfully Created")
-print(f"\nTool Name:\n{search_financial_stress_knowledge.name}")
-print(f"\nTool Description:\n{search_financial_stress_knowledge.description[:200]}...")
-print("\nRAG Knowledge Base Ready\n")
+        src = doc.metadata.get("source") or str(PDF_PATH.resolve())
+        loc = ""
+        cite = f"file://{Path(src).resolve()}"
+        if page is not None:
+            try:
+                pn = int(page) + 1
+                loc = f" (page {pn})"
+                cite += f"#page={pn}"
+            except (TypeError, ValueError):
+                pass
+        blocks.append(
+            f"[Source {index}{loc}]\nCitation: {cite}\n\n{doc.page_content.strip()}"
+        )
+    return "\n\n".join(blocks)

@@ -1,20 +1,19 @@
 """
-Streamlit dashboard for early-warning CSV output from app.py.
+Early-warning dashboard: reads ``early_warning_signals.csv`` and runs ``python app.py`` on demand.
 
-Run from this directory:
   streamlit run streamlit_app.py
 
-On first load, if the CSV is missing or has no rows, this app runs
-`python app.py` once automatically (same as the CLI pipeline).
-
-Tip: set EARLY_WARNING_APPEND_CSV=1 before runs so history accumulates by day.
+First session load with an empty CSV triggers one pipeline run. Optional: ``EARLY_WARNING_APPEND_CSV=1``.
+Do not run ``python app.py`` in a terminal concurrently with a Streamlit scan (embedded Qdrant lock).
 """
 
 from __future__ import annotations
 
 import html
+import re
 import subprocess
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -29,12 +28,8 @@ load_dotenv()
 CSV_PATH = APP_DIR / "early_warning_signals.csv"
 LOGO_PATH = APP_DIR / "data" / "image.png"
 
-ALLOWED_RISK_CATEGORIES = frozenset({
-    "US military escalation",
-    "oil price spike",
-    "bank liquidity crisis",
-    "cyberattack on banks",
-})
+# Embedded Qdrant allows only one process on ``data/qdrant``; avoid overlapping ``app.py`` subprocesses.
+_RISK_SCAN_LOCK = threading.Lock()
 
 RISK_CATEGORY_ORDER = (
     "US military escalation",
@@ -42,6 +37,7 @@ RISK_CATEGORY_ORDER = (
     "bank liquidity crisis",
     "cyberattack on banks",
 )
+ALLOWED_RISK_CATEGORIES = frozenset(RISK_CATEGORY_ORDER)
 
 
 def _category_sort_key(cat: str) -> int:
@@ -72,6 +68,7 @@ CSV_COLUMNS = [
     "potential impact (high/medium/low)",
     "chunk",
     "URL",
+    "historical_analog_impact",
 ]
 
 IMPACT_STYLES = {
@@ -79,6 +76,8 @@ IMPACT_STYLES = {
     "medium": ("#ffe082", "#f57f17", "#f57f17"),
     "low": ("#c8e6c9", "#1b5e20", "#2e7d32"),
 }
+
+_SIDEBAR_LOG_TAIL_CHARS = 24_000
 
 
 def _csv_has_signal_rows(path: Path) -> bool:
@@ -92,16 +91,80 @@ def _csv_has_signal_rows(path: Path) -> bool:
         return False
 
 
-def run_risk_scan() -> subprocess.CompletedProcess:
-    """Run the same pipeline as `python app.py` (inherits env including .env above)."""
-    return subprocess.run(
-        [sys.executable, str(APP_DIR / "app.py")],
-        cwd=str(APP_DIR),
-        capture_output=True,
-        text=True,
-        timeout=3600,
-        env=None,
+_LOG_SECTION_LINE = re.compile(
+    r"(?m)^(Loading IMF|\[qdrant\]|RAG \+ historical index ready\.|Starting surveillance|"
+    r"\[agent LLM\]|\[structured LLM\]|\[csv\]|Structured rows…|Analog impacts…|Done\.)"
+)
+
+
+def prettify_pipeline_log(text: str) -> str:
+    """Insert blank lines before major sections for readability."""
+    text = text.replace("\r\n", "\n").strip("\n")
+    if not text:
+        return ""
+    spaced = _LOG_SECTION_LINE.sub(r"\n\n\1", text)
+    spaced = re.sub(r"\n{3,}", "\n\n", spaced)
+    return spaced.strip()
+
+
+def pipeline_log_html(text: str, *, tail_chars: int = _SIDEBAR_LOG_TAIL_CHARS) -> str:
+    raw = text[-tail_chars:] if len(text) > tail_chars else text
+    pretty = prettify_pipeline_log(raw)
+    esc = html.escape(pretty)
+    return (
+        '<pre style="white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,SFMono-Regular,'
+        "Menlo,Consolas,monospace;font-size:0.78rem;line-height:1.55;padding:0.9rem 1rem;margin:0;"
+        "background:rgba(128,128,128,0.08);border-radius:0.5rem;border:1px solid rgba(128,128,128,0.22);"
+        f'">{esc}</pre>'
     )
+
+
+def run_risk_scan(*, stream_log=None, stream_status=None) -> subprocess.CompletedProcess:
+    """Run ``python app.py``; optionally stream merged stdout/stderr into a Streamlit placeholder."""
+    args = [sys.executable, "-u", str(APP_DIR / "app.py")]
+    with _RISK_SCAN_LOCK:
+        if stream_status is not None:
+            stream_status.markdown("*Pipeline running…*")
+
+        proc = subprocess.Popen(
+            args,
+            cwd=str(APP_DIR),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=None,
+        )
+        chunks: list[str] = []
+        assert proc.stdout is not None
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            chunks.append(line)
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            if stream_log is not None:
+                combined = "".join(chunks)
+                stream_log.markdown(
+                    pipeline_log_html(combined),
+                    unsafe_allow_html=True,
+                )
+
+        rc = proc.wait()
+        if stream_status is not None:
+            stream_status.empty()
+
+        full_out = "".join(chunks)
+        return subprocess.CompletedProcess(args=args, returncode=rc, stdout=full_out, stderr="")
+
+
+def _record_scan_result(proc: subprocess.CompletedProcess) -> None:
+    load_signals.clear()
+    st.session_state["_last_scan_returncode"] = proc.returncode
+    st.session_state["_last_scan_log"] = (
+        (proc.stderr or "").strip() + "\n" + (proc.stdout or "").strip()
+    ).strip()
 
 
 def _normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
@@ -148,30 +211,46 @@ def format_ts(ts_val) -> str:
         return str(ts_val)
 
 
+def draw_sidebar_pipeline_log(
+    log_ph,
+    exit_ph,
+    last_log: str,
+    last_rc: int | None,
+) -> None:
+    """Show formatted log + exit status (after rerun, or when no live stream ran this cycle)."""
+    text = (last_log or "").strip()
+    if last_rc is not None:
+        if last_rc == 0:
+            exit_ph.success(f"Last **app.py** exit code: **{last_rc}**")
+        else:
+            exit_ph.error(f"Last **app.py** exit code: **{last_rc}**")
+    else:
+        exit_ph.empty()
+
+    if not text:
+        log_ph.info("No capture yet. Use **Run new scan** or wait for the first-load pipeline.")
+        return
+    log_ph.markdown(pipeline_log_html(text), unsafe_allow_html=True)
+
+
 def main() -> None:
     st.set_page_config(
         page_title="Investment Bank Risk Monitor",
         layout="wide",
-        initial_sidebar_state="collapsed",
+        initial_sidebar_state="expanded",
     )
 
     BOOTSTRAP_KEY = "_streamlit_pipeline_bootstrapped"
     if BOOTSTRAP_KEY not in st.session_state:
         st.session_state[BOOTSTRAP_KEY] = False
 
-    if not st.session_state[BOOTSTRAP_KEY]:
-        st.session_state[BOOTSTRAP_KEY] = True
-        if not _csv_has_signal_rows(CSV_PATH):
-            with st.spinner(
-                "Running initial pipeline (**python app.py**) — first load only…"
-            ):
-                proc = run_risk_scan()
-            load_signals.clear()
-            st.session_state["_last_scan_returncode"] = proc.returncode
-            st.session_state["_last_scan_log"] = (
-                (proc.stderr or "").strip() + "\n" + (proc.stdout or "").strip()
-            ).strip()
-            st.rerun()
+    with st.sidebar:
+        st.markdown("### Pipeline log")
+        st.caption(
+            "Live stream while **app.py** runs (**-u** unbuffered). Same lines as your terminal."
+        )
+        sidebar_exit_ph = st.empty()
+        sidebar_log_ph = st.empty()
 
     logo_col, title_col = st.columns([1, 6])
     with logo_col:
@@ -182,38 +261,42 @@ def main() -> None:
     with title_col:
         st.markdown(
             "# Investment Bank Risk Monitor",
-            help="Early-warning signals from RAG + news pipeline (CSV)",
+            help="RAG-built signals + historical-analog impact summaries (CSV)",
         )
 
     st.divider()
 
-    c1, c2 = st.columns([3, 1])
-    with c1:
-        st.caption(
-            f"Reading **`{CSV_PATH.name}`** · `.env` is loaded for this process "
-            f"(and child **`app.py`** runs). Append history: "
-            "`EARLY_WARNING_APPEND_CSV=1`."
-        )
-    with c2:
+    if not st.session_state[BOOTSTRAP_KEY]:
+        st.session_state[BOOTSTRAP_KEY] = True
+        if not _csv_has_signal_rows(CSV_PATH):
+            with st.spinner(
+                "Running initial pipeline (**python app.py**) — first load only…"
+            ):
+                proc = run_risk_scan(
+                    stream_log=sidebar_log_ph,
+                    stream_status=sidebar_exit_ph,
+                )
+            _record_scan_result(proc)
+            st.rerun()
+
+    _, run_col = st.columns([5, 1])
+    with run_col:
         if st.button("Run new scan", help="Executes app.py in this folder"):
             with st.spinner("Running scan…"):
-                proc = run_risk_scan()
-            load_signals.clear()
-            st.session_state["_last_scan_returncode"] = proc.returncode
-            st.session_state["_last_scan_log"] = (
-                (proc.stderr or "").strip() + "\n" + (proc.stdout or "").strip()
-            ).strip()
+                proc = run_risk_scan(
+                    stream_log=sidebar_log_ph,
+                    stream_status=sidebar_exit_ph,
+                )
+            _record_scan_result(proc)
             if proc.returncode != 0:
-                st.error("Scan exited with an error — expand details below.")
+                st.error("Scan failed — see **Pipeline log** in the sidebar.")
             else:
                 st.success("Scan finished.")
             st.rerun()
 
     last_rc = st.session_state.get("_last_scan_returncode")
     last_log = st.session_state.get("_last_scan_log", "")
-    if last_rc is not None and last_rc != 0 and last_log:
-        with st.expander("Last scan stderr / stdout (debug)"):
-            st.code(last_log[-12000:] or "(empty)", language="text")
+    draw_sidebar_pipeline_log(sidebar_log_ph, sidebar_exit_ph, last_log, last_rc)
 
     mtime = CSV_PATH.stat().st_mtime if CSV_PATH.is_file() else 0.0
     df = load_signals(str(CSV_PATH), mtime)
@@ -222,7 +305,7 @@ def main() -> None:
         if last_rc is not None and last_rc != 0:
             st.error(
                 "The automatic or last manual scan **failed**. "
-                "Check **OPENAI_API_KEY**, **`data/imf-report.pdf`**, and the log above."
+                "Check **OPENAI_API_KEY**, **`data/imf-report.pdf`**, and the sidebar **Pipeline log**."
             )
         elif last_rc == 0:
             st.warning(
@@ -330,6 +413,12 @@ def main() -> None:
                             disabled=True,
                             label_visibility="collapsed",
                         )
+                        impact_txt = str(
+                            row.get("historical_analog_impact", "") or ""
+                        ).strip()
+                        if impact_txt:
+                            st.markdown("**Impact from historical analogs**")
+                            st.markdown(impact_txt)
                         if i < n_src:
                             st.divider()
 
@@ -338,8 +427,6 @@ def main() -> None:
                     risk_oval_markdown(grp_impact),
                     unsafe_allow_html=True,
                 )
-                if n_src > 1:
-                    st.caption("Oval = **highest** impact among sources in this group.")
 
 
 if __name__ == "__main__":

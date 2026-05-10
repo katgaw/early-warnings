@@ -1,58 +1,36 @@
 """
 ===========================================================
-EARLY WARNING RISK MONITORING SYSTEM
+INVESTMENT BANK EARLY WARNING SYSTEM
 ===========================================================
-This project monitors potential financial risk signals using:
 
-1. RAG Knowledge Base
-   - IMF reports
-   - Banking stress documents
-   - Financial contagion research
+This app monitors financial risks using:
 
-2. Real-Time News Search
-   - Geopolitical events
-   - Cyberattacks
-   - Oil price shocks
-   - Banking crises
+1. IMF RAG knowledge search (search_financial_stress_knowledge)
+2. Agent surveillance + tool-use logging
+3. Structured LLM extraction → CSV rows (matches Streamlit dashboard)
+4. Historical analog impact enrichment (Qdrant + LLM)
 
 -----------------------------------------------------------
-TWO LLM ARCHITECTURE
+WORKFLOW
 -----------------------------------------------------------
-LLM #1 → AGENT MODEL (GPT-5)
---------------------------------
-Role:
-- Thinks like a financial analyst
-- Decides what to search
-- Calls tools
-- Collects evidence
 
-LLM #2 → STRUCTURED MODEL (GPT-4o-mini)
-----------------------------------------
-Role:
-- Reads collected evidence
-- Extracts important signals
-- Creates structured CSV rows
+Search IMF / gather tool evidence
+        ↓
+Structured warning rows (risk_category, chunk, URL, …)
+        ↓
+Save to early_warning_signals.csv
+        ↓
+Add historical_analog_impact per yes-row
 
 -----------------------------------------------------------
-FINAL OUTPUT
+RUN
 -----------------------------------------------------------
-Creates:
-    early_warning_signals.csv
 
-Containing:
-- risk signal
-- headline
-- country
-- impact level
-- evidence
-- URL
+  python app.py
 
-Prerequisites:
-- pip install -r ../requirements.txt (includes feedparser for news_tool)
-- OPENAI_API_KEY in environment or .env (RAG embeddings + LLMs)
-- data/imf-report.pdf next to rag_tool.py (see rag_tool PDF_PATH)
+Env: EARLY_WARNING_AGENT_MODEL, EARLY_WARNING_STRUCT_MODEL, EARLY_WARNING_MAX_YES_ROWS,
+EARLY_WARNING_APPEND_CSV, EARLY_WARNING_CHUNK_CSV_MAX, EARLY_WARNING_AGENT_*_LIMIT, …
 
-Run from this directory: python app.py (working directory is set automatically).
 ===========================================================
 """
 
@@ -60,11 +38,15 @@ from __future__ import annotations
 
 import csv
 import os
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-# Cwd + .env before tool imports (rag_tool loads PDF/embeddings; needs OPENAI_API_KEY).
+# =========================================================
+# ENVIRONMENT SETUP
+# =========================================================
+
 APP_DIR = Path(__file__).resolve().parent
 os.chdir(APP_DIR)
 
@@ -72,6 +54,25 @@ from dotenv import load_dotenv
 
 load_dotenv(APP_DIR / ".env")
 load_dotenv()
+
+# =========================================================
+# WARNINGS (LangGraph / LangChain deprecations)
+# =========================================================
+
+try:
+    from langchain_core._api.deprecation import LangChainPendingDeprecationWarning
+except ImportError:
+    LangChainPendingDeprecationWarning = DeprecationWarning  # type: ignore[misc, assignment]
+
+warnings.filterwarnings("ignore", category=LangChainPendingDeprecationWarning)
+warnings.filterwarnings(
+    "ignore",
+    message=r"The default value of [`']allowed_objects[`'] will change.*",
+)
+
+# =========================================================
+# IMPORTS
+# =========================================================
 
 from langchain.agents import create_agent
 from langchain.agents.middleware import (
@@ -83,31 +84,38 @@ from langchain_core.messages import ToolMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
-from news_tool import RISK_NEWS_KEYWORDS, search_risk_news_articles
+from news_tool import assess_impact_for_csv_row, assess_impact_for_signal
 from rag_tool import search_financial_stress_knowledge
 
+# =========================================================
+# PATHS & MODELS
+# =========================================================
+
 CSV_PATH = APP_DIR / "early_warning_signals.csv"
-
-# =========================================================
-# MODEL CONFIGURATION
-# =========================================================
-
-AGENT_MODEL = os.environ.get("EARLY_WARNING_AGENT_MODEL", "gpt-5")
+AGENT_MODEL = os.environ.get("EARLY_WARNING_AGENT_MODEL", "gpt-4o-mini")
 STRUCTURED_MODEL = os.environ.get("EARLY_WARNING_STRUCT_MODEL", "gpt-4o-mini")
 
 # =========================================================
-# SEARCH CONFIGURATION
+# RAG FALLBACK (no tool messages)
 # =========================================================
 
-RAG_QUERIES = [
-    "systemic financial stress banking liquidity risk indicators vulnerability",
-    "geopolitical shocks commodity prices contagion emerging market stress",
+RAG_FALLBACK_QUERIES = [
+    "IMF geopolitical conflict military escalation sanctions financial stability transmission banking",
+    "IMF oil commodity energy price shock inflation financial stress emerging markets",
+    "IMF bank liquidity funding stress systemic banking crisis vulnerability indicators",
+    "IMF cyber attack operational resilience financial sector digital infrastructure risk",
 ]
-NEWS_KEYWORDS = list(RISK_NEWS_KEYWORDS)
 
 # =========================================================
-# CSV CONFIGURATION
+# RISK CATEGORIES (aligned with streamlit_app.RISK_CATEGORY_ORDER)
 # =========================================================
+
+RISK_CATEGORIES = [
+    "US military escalation",
+    "oil price spike",
+    "bank liquidity crisis",
+    "cyberattack on banks",
+]
 
 RISK_CATEGORY_LITERAL = Literal[
     "US military escalation",
@@ -115,6 +123,10 @@ RISK_CATEGORY_LITERAL = Literal[
     "bank liquidity crisis",
     "cyberattack on banks",
 ]
+
+# =========================================================
+# CSV HEADERS (must match streamlit_app.CSV_COLUMNS)
+# =========================================================
 
 CSV_HEADERS = [
     "timestamp",
@@ -125,298 +137,277 @@ CSV_HEADERS = [
     "potential impact (high/medium/low)",
     "chunk",
     "URL",
+    "historical_analog_impact",
 ]
 
 # =========================================================
-# LOGGING MIDDLEWARE
+# AGENT PROMPT
 # =========================================================
 
-model_call_count = 0
+SYSTEM_PROMPT = """You are a bank risk surveillance analyst.
+
+Rules:
+- Use tools for factual claims; never invent URLs or quotes.
+- search_financial_stress_knowledge: run **four separate searches**, one per theme (parallel OK):
+  (1) US military escalation — conflict, sanctions, geopolitical shocks to finance
+  (2) oil price spike — commodities, energy, inflation spillovers
+  (3) bank liquidity crisis — funding stress, systemic banking
+  (4) cyberattack on banks — cyber risk, operational resilience
+- assess_impact_for_signal: skip unless one live demo is essential; batch analog impacts run after CSV.
+
+End with a brief risk summary."""
+
+# =========================================================
+# AGENT MIDDLEWARE (terminal logs)
+# =========================================================
+
+_agent_llm_step = 0
 
 
 @before_model
-def log_before_model(state, runtime):
-    """Runs BEFORE every LLM call; logs call count and message depth."""
-    global model_call_count
-    model_call_count += 1
-    message_count = len(state.get("messages", []))
-    print(f"[LOG] Model Call #{model_call_count} | Messages: {message_count}")
+def log_before_agent_model(state, runtime):
+    global _agent_llm_step
+    _agent_llm_step += 1
+    n = len(state.get("messages", []))
+    print(
+        f"[agent LLM] model={AGENT_MODEL!r} | call #{_agent_llm_step} | "
+        f"messages_in_thread={n}"
+    )
     return None
 
 
 @after_model
-def log_after_model(state, runtime):
-    """Runs AFTER every LLM call; logs whether tool calls were requested."""
-    last_message = (
-        state.get("messages", [])[-1] if state.get("messages") else None
-    )
-    if last_message:
-        has_tool_calls = (
-            hasattr(last_message, "tool_calls") and last_message.tool_calls
-        )
-        print(f"[LOG] Tool Calls Requested: {has_tool_calls}")
+def log_after_agent_model(state, runtime):
+    msgs = state.get("messages") or []
+    last = msgs[-1] if msgs else None
+    if not last:
+        return None
+    raw_calls = getattr(last, "tool_calls", None) or []
+    if not raw_calls:
+        print("[agent LLM] tools requested: (none — model returned text)")
+        return None
+    names: list[str] = []
+    for tc in raw_calls:
+        if isinstance(tc, dict):
+            names.append(str(tc.get("name") or "?"))
+        else:
+            names.append(str(getattr(tc, "name", None) or "?"))
+    print(f"[agent LLM] tools requested: {', '.join(names)}")
     return None
 
 
-call_limiter = ModelCallLimitMiddleware(
-    thread_limit=25,
-    run_limit=25,
+_agent_call_limiter = ModelCallLimitMiddleware(
+    thread_limit=int(os.environ.get("EARLY_WARNING_AGENT_THREAD_LIMIT", "25")),
+    run_limit=int(os.environ.get("EARLY_WARNING_AGENT_RUN_LIMIT", "25")),
     exit_behavior="end",
 )
 
 # =========================================================
-# TOOLS AVAILABLE TO THE AGENT
+# CREATE AGENT
 # =========================================================
 
-early_warning_tools = [
-    search_financial_stress_knowledge,
-    search_risk_news_articles,
-]
-
-# =========================================================
-# AGENT LLM (LLM #1)
-# =========================================================
-
-early_warning_agent = create_agent(
+agent = create_agent(
     model=AGENT_MODEL,
-    tools=early_warning_tools,
-    system_prompt="""
-You are an early-warning analyst for US investment bank risk surveillance.
-
-IMPORTANT:
-- You MUST use tools for all factual retrieval.
-- Never invent headlines or citations.
-
---------------------------------------------------
-REQUIRED PROCEDURE
---------------------------------------------------
-
-1. Search the RAG knowledge base multiple times
-   using queries related to:
-   - systemic stress
-   - banking liquidity
-   - contagion
-   - geopolitical transmission
-
-2. Search news articles using these keywords:
-   - US military escalation
-   - oil price spike
-   - bank liquidity crisis
-   - cyberattack on banks
-
-3. After retrieval:
-   - summarize major themes
-   - identify potential risks
-   - provide analyst-style commentary
-""",
+    tools=[search_financial_stress_knowledge, assess_impact_for_signal],
+    system_prompt=SYSTEM_PROMPT,
     middleware=[
-        log_before_model,
-        log_after_model,
-        call_limiter,
+        log_before_agent_model,
+        log_after_agent_model,
+        _agent_call_limiter,
     ],
 )
 
-# =========================================================
-# STRUCTURED OUTPUT SCHEMA
-# =========================================================
 
+# =========================================================
+# STRUCTURED OUTPUT SCHEMA (CSV row extraction)
+# =========================================================
 
 class EarlyWarningRow(BaseModel):
-    """One CSV row representing one possible risk signal."""
-
     early_warning: Literal["yes", "no"] = Field(
-        description=(
-            "Whether this item should be monitored "
-            "as a potential early-warning signal."
-        )
+        description='"yes" only for clearly material bank-relevant risks; prefer "no".'
     )
-    risk_category: RISK_CATEGORY_LITERAL = Field(
-        description=(
-            "Exactly one of the four bank monitoring themes (same strings as the "
-            "news searches). For IMF PDF excerpts (file:// URL), infer the single "
-            "best-fitting theme from the passage content — never use any other label."
-        )
-    )
-    article_headlines: str = Field(description="Headline or short title.")
-    source_country: str = Field(
-        description="Country or region where risk originates."
-    )
-    potential_impact: Literal["high", "medium", "low"] = Field(
-        description="Potential impact on US markets."
-    )
-    chunk: str = Field(
-        description=(
-            "Evidence text copied from the source: prefer several contiguous "
-            "sentences (roughly 400–2500 characters). Do not compress to a single "
-            "short sentence unless the source truly contains only that much."
-        )
-    )
-    url: str = Field(description="Source URL or citation.")
+    risk_category: RISK_CATEGORY_LITERAL = Field()
+    article_headlines: str = Field()
+    source_country: str = Field()
+    potential_impact: Literal["high", "medium", "low"] = Field()
+    chunk: str = Field(description="Excerpt from tool evidence.")
+    url: str = Field(description="Exact citation from evidence.")
 
 
 class EarlyWarningAssessment(BaseModel):
-    """Full structured output containing all rows."""
-
     rows: list[EarlyWarningRow]
 
 
 # =========================================================
-# HELPER: EXTRACT TOOL OUTPUTS
+# EVIDENCE HELPERS
 # =========================================================
 
-
-def extract_tool_outputs(messages) -> str:
-    """Extracts all tool outputs from LangChain messages."""
-    parts = []
-    for message in messages:
-        if isinstance(message, ToolMessage) and message.content:
-            parts.append(str(message.content))
-    return "\n\n=====\n\n".join(parts)
+def tool_evidence(messages) -> str:
+    return "\n\n=====\n\n".join(
+        str(m.content)
+        for m in messages
+        if isinstance(m, ToolMessage) and m.content
+    )
 
 
-# =========================================================
-# FALLBACK: DIRECT TOOL EXECUTION
-# =========================================================
-
-
-def gather_evidence_direct() -> str:
-    """Runs tools directly if the agent fails to produce tool outputs."""
-    parts = []
-    for query in RAG_QUERIES:
-        result = search_financial_stress_knowledge.invoke({"query": query})
-        parts.append(result)
-    for keyword in NEWS_KEYWORDS:
-        result = search_risk_news_articles.invoke({"keyword": keyword})
-        parts.append(result)
-    return "\n\n=====\n\n".join(parts)
+def rag_fallback_evidence() -> str:
+    return "\n\n=====\n\n".join(
+        search_financial_stress_knowledge.invoke({"query": q}) for q in RAG_FALLBACK_QUERIES
+    )
 
 
 # =========================================================
-# STRUCTURED EXTRACTION (LLM #2)
+# STRUCTURED ROW EXTRACTION
 # =========================================================
 
+def _max_yes_rows() -> int | None:
+    raw = os.environ.get("EARLY_WARNING_MAX_YES_ROWS", "").strip()
+    if raw.isdigit():
+        return max(0, int(raw))
+    return None
 
-def extract_assessment(evidence_text: str) -> EarlyWarningAssessment:
-    """Uses a second LLM to transform raw evidence into structured CSV rows."""
-    max_chars = int(os.environ.get("EARLY_WARNING_MAX_EVIDENCE_CHARS", "120000"))
-    if len(evidence_text) > max_chars:
-        evidence_text = evidence_text[:max_chars] + "\n\n[TRUNCATED]\n"
+
+def rows_from_evidence(evidence: str) -> EarlyWarningAssessment:
+    cap_ev = int(os.environ.get("EARLY_WARNING_MAX_EVIDENCE_CHARS", "120000"))
+    if len(evidence) > cap_ev:
+        evidence = evidence[:cap_ev] + "\n\n[TRUNCATED]\n"
+    print(
+        f"[structured LLM] model={STRUCTURED_MODEL!r} | "
+        f"evidence_chars={len(evidence)} (CSV row extraction)"
+    )
     llm = ChatOpenAI(model=STRUCTURED_MODEL, temperature=0)
-    structured_llm = llm.with_structured_output(EarlyWarningAssessment)
-    prompt = f"""
-You are converting financial evidence into a structured
-early-warning monitoring table.
+    structured = llm.with_structured_output(EarlyWarningAssessment)
+    max_yes = _max_yes_rows()
+    cap_line = ""
+    if max_yes is not None:
+        cap_line = (
+            f"\n- At most {max_yes} row(s) may use early_warning=yes; "
+            "all other rows early_warning=no.\n"
+        )
+    themes = " | ".join(RISK_CATEGORIES)
+    prompt = f"""Build early-warning rows from tool evidence only.
 
-RULES:
-- One Google News article = one row (never merge multiple articles).
-- One IMF PDF [Source N] block = one row (never merge multiple PDF blocks).
-- You MUST emit separate rows for IMF PDF evidence and for news evidence when both qualify:
-  many rows may share the same risk_category but must have different url/chunk.
-- Do not drop IMF/file:// rows just because news rows exist for the same theme.
-- Only mark "yes" for meaningful risks
-- Estimate impact level (high / medium / low) for US investment banks
-- For field "chunk": copy a substantive excerpt from THAT item only — usually several
-  sentences or a full paragraph from the IMF Content block or the news Summary,
-  about 400–2500 characters when available. Avoid one-sentence summaries.
-- Preserve URLs / file:// citations exactly from the evidence (field "url")
-
-risk_category — MUST be exactly one of these four strings (no other spelling):
-- "US military escalation"
-- "oil price spike"
-- "bank liquidity crisis"
-- "cyberattack on banks"
-
-How to choose risk_category:
-- If the row is from a Google News item under a keyword block, use that keyword phrase.
-- If the row is from an IMF PDF chunk (file:// citation in the evidence), pick the ONE theme
-  the passage best supports, for example:
-  • banking runs, liquidity stress, systemic stress tests, solvency → "bank liquidity crisis"
-  • oil, energy shocks, commodity spikes → "oil price spike"
-  • conflict, escalation, defense, geopolitical military tension → "US military escalation"
-  • cyber, ransomware, operational outages at banks → "cyberattack on banks"
-  If several fit, choose the dominant risk in the excerpt.
-
+- Distinct URLs or IMF [Source N] blocks; do not merge unrelated sources.
+- For each source, consider all four themes ({themes}).
+  If multiple themes are material, one row per (source + theme); reuse url; tailor chunk/headline to that theme.
+- early_warning=yes only when material; chunk and url must match evidence.
+{cap_line}
 Evidence:
-{evidence_text}
+{evidence}
 """
-    return structured_llm.invoke(prompt)
+    return structured.invoke(prompt)
 
 
 # =========================================================
-# WRITE CSV FILE
+# WRITE CSV
 # =========================================================
-
 
 def write_csv(path: Path, assessment: EarlyWarningAssessment) -> int:
-    """Writes ONLY rows marked as early_warning = yes.
-
-    Set EARLY_WARNING_APPEND_CSV=1 to append rows (keeps history by scan day).
-    Default overwrites the file for a single latest snapshot.
-    """
-    yes_rows = [row for row in assessment.rows if row.early_warning == "yes"]
-    append = os.environ.get("EARLY_WARNING_APPEND_CSV", "").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
-    run_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    yes = [r for r in assessment.rows if r.early_warning == "yes"]
+    cap = _max_yes_rows()
+    if cap is not None:
+        yes = yes[:cap]
+        print(f"[csv] EARLY_WARNING_MAX_YES_ROWS={cap} → writing {len(yes)} yes row(s)")
+    append = os.environ.get("EARLY_WARNING_APPEND_CSV", "").lower() in ("1", "true", "yes")
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     mode = "a" if append and path.is_file() else "w"
     write_header = mode == "w" or not path.is_file()
-    with path.open(mode, newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=CSV_HEADERS)
+    chunk_cap = int(os.environ.get("EARLY_WARNING_CHUNK_CSV_MAX", "2500"))
+
+    if not yes:
+        if append and path.is_file():
+            print("[csv] no yes rows; nothing appended.")
+            return 0
+        if mode == "w" and path.is_file():
+            try:
+                with path.open(newline="", encoding="utf-8") as f:
+                    existing_rows = sum(1 for _ in csv.DictReader(f))
+                if existing_rows > 0:
+                    print(
+                        "[csv] no yes rows from this run; keeping existing CSV unchanged."
+                    )
+                    return 0
+            except Exception:
+                pass
+
+    with path.open(mode, newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_HEADERS)
         if write_header:
-            writer.writeheader()
-        chunk_cap = int(os.environ.get("EARLY_WARNING_CHUNK_CSV_MAX", "2500"))
-        for row in yes_rows:
-            if len(row.chunk) > chunk_cap:
-                chunk = row.chunk[: chunk_cap - 3] + "..."
-            else:
-                chunk = row.chunk
-            writer.writerow({
-                "timestamp": run_ts,
-                "risk_category": row.risk_category,
-                "early warning": row.early_warning,
-                "article headlines": row.article_headlines,
-                "source country": row.source_country,
-                "potential impact (high/medium/low)": row.potential_impact,
+            w.writeheader()
+        for r in yes:
+            chunk = r.chunk if len(r.chunk) <= chunk_cap else r.chunk[: chunk_cap - 3] + "..."
+            w.writerow({
+                "timestamp": ts,
+                "risk_category": r.risk_category,
+                "early warning": r.early_warning,
+                "article headlines": r.article_headlines,
+                "source country": r.source_country,
+                "potential impact (high/medium/low)": r.potential_impact,
                 "chunk": chunk,
-                "URL": row.url,
+                "URL": r.url,
+                "historical_analog_impact": "",
             })
-    return len(yes_rows)
+    return len(yes)
 
 
 # =========================================================
-# MAIN PIPELINE
+# HISTORICAL ANALOG IMPACTS (enrich yes-rows)
 # =========================================================
 
+def enrich_impacts(path: Path) -> int:
+    if not path.is_file():
+        return 0
+    with path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        fields = list(reader.fieldnames or [])
+        if "historical_analog_impact" not in fields:
+            fields.append("historical_analog_impact")
+        out, n = [], 0
+        for raw in reader:
+            row = {fn: (raw.get(fn) or "").strip() for fn in fields}
+            if row.get("early warning", "").lower() == "yes":
+                row["historical_analog_impact"] = assess_impact_for_csv_row(row)
+                n += 1
+            out.append(row)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for row in out:
+            w.writerow({k: row.get(k, "") for k in fields})
+    return n
 
-def main():
-    """Agent gathers evidence → structured extraction → CSV."""
-    print("\nRunning Early Warning Agent...\n")
-    user_instruction = """
-Execute the complete early-warning monitoring workflow:
-- run all required searches
-- gather evidence
-- summarize key risks
-"""
-    response = early_warning_agent.invoke({
-        "messages": [{"role": "user", "content": user_instruction}],
-    })
-    evidence = extract_tool_outputs(response["messages"]).strip()
-    if not evidence:
-        print(
-            "No tool outputs found."
-            " Running direct retrieval fallback..."
-        )
-        evidence = gather_evidence_direct()
-    print("\nStructuring risk signals...\n")
-    assessment = extract_assessment(evidence)
-    rows_written = write_csv(CSV_PATH, assessment)
+
+# =========================================================
+# MAIN
+# =========================================================
+
+def main() -> None:
+    global _agent_llm_step
+    _agent_llm_step = 0
     print(
-        f"\nFinished."
-        f"\nRows Written: {rows_written}"
-        f"\nCSV Path: {CSV_PATH.resolve()}"
+        f"Starting surveillance | AGENT_MODEL={AGENT_MODEL!r} | "
+        f"STRUCTURED_MODEL={STRUCTURED_MODEL!r}"
     )
+    response = agent.invoke({
+        "messages": [{
+            "role": "user",
+            "content": (
+                "Run surveillance: search_financial_stress_knowledge **four times** "
+                "(military/geopolitical, oil/commodities, bank liquidity, cyber). "
+                "Skip assess_impact_for_signal unless essential for a demo."
+            ),
+        }],
+    })
+    evidence = tool_evidence(response["messages"]).strip()
+    if not evidence:
+        print("No tool messages; RAG fallback.")
+        evidence = rag_fallback_evidence()
+    print("Structured rows…")
+    assessment = rows_from_evidence(evidence)
+    written = write_csv(CSV_PATH, assessment)
+    print("Analog impacts…")
+    impacts = enrich_impacts(CSV_PATH)
+    print(f"Done. rows={written}, impacts={impacts}. {CSV_PATH.resolve()}")
 
 
 # =========================================================

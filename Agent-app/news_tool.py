@@ -1,252 +1,138 @@
 """
-===========================================================
-GOOGLE NEWS RSS SEARCH TOOL
-===========================================================
+Historical analog impact: cosine retrieval against rag_tool's historical index,
+then a small LLM summarizes likely market/macro impacts.
 
-This script creates a LangChain tool that searches recent
-Google News articles related to financial and geopolitical risk.
-
-No paid API is required.
-
------------------------------------------------------------
-PURPOSE
------------------------------------------------------------
-
-The agent can call this tool to search recent news about:
-
-1. US military escalation
-2. Oil price spikes
-3. Bank liquidity crises
-4. Cyberattacks on banks
-
------------------------------------------------------------
-REQUIREMENT
------------------------------------------------------------
-
-Install feedparser:
-
-    pip install feedparser
-
-===========================================================
+Exports:
+  assess_impact_for_signal — LangChain tool (for agent demos; pass chunk/headline fields).
+  assess_impact_for_csv_row — same logic using a full CSV row dict (app.py enrichment).
 """
 
-# =========================================================
-# IMPORTS
-# =========================================================
+from __future__ import annotations
 
-from urllib.parse import quote_plus
+import os
 
-import feedparser
+from langchain_core.documents import Document
 from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
+
+from rag_tool import historical_vector_store
+
+IMPACT_MODEL = os.environ.get("EARLY_WARNING_STRUCT_MODEL", "gpt-4o-mini")
+TOP_K = 3
 
 
-# =========================================================
-# ALLOWED NEWS SEARCH KEYWORDS
-# =========================================================
-
-RISK_NEWS_KEYWORDS = (
-    "US military escalation",
-    "oil price spike",
-    "bank liquidity crisis",
-    "cyberattack on banks",
-)
-
-KEYWORD_ALIASES = {
-    keyword.lower().strip(): keyword
-    for keyword in RISK_NEWS_KEYWORDS
-}
+def build_query_text(row: dict[str, str]) -> str:
+    """Text sent through the embedding model (chunk preferred, else headline)."""
+    return (row.get("chunk") or row.get("article headlines") or "").strip()
 
 
-# =========================================================
-# HELPER FUNCTION:
-# VALIDATE KEYWORD
-# =========================================================
-
-def normalize_keyword(keyword: str) -> str | None:
-    """
-    Map user input to one approved search phrase.
-
-    Matching is case-insensitive.
-
-    Example:
-        "Oil Price Spike" -> "oil price spike"
-    """
-
-    return KEYWORD_ALIASES.get(
-        keyword.lower().strip()
-    )
+def retrieve_analogs(
+    query: str,
+    top_k: int = TOP_K,
+    *,
+    k: int | None = None,
+) -> list[tuple[Document, float]]:
+    """Optional keyword k is an alias for top_k (LangChain-style)."""
+    n = k if k is not None else top_k
+    return historical_vector_store.similarity_search_with_score(query, k=n)
 
 
-# =========================================================
-# HELPER FUNCTION:
-# BUILD GOOGLE NEWS RSS URL
-# =========================================================
-
-def build_google_news_rss_url(keyword: str) -> str:
-    """
-    Build a Google News RSS search URL.
-
-    The query searches recent Google News results.
-    """
-
-    encoded_query = quote_plus(keyword)
-
-    return (
-        "https://news.google.com/rss/search?"
-        f"q={encoded_query}"
-        "&hl=en-US"
-        "&gl=US"
-        "&ceid=US:en"
-    )
-
-
-# =========================================================
-# HELPER FUNCTION:
-# CLEAN ARTICLE TEXT
-# =========================================================
-
-def clean_text(text: str | None, max_chars: int = 1200) -> str:
-    """
-    Clean and shorten article summaries.
-    """
-
-    if not text:
-        return ""
-
-    cleaned = " ".join(text.split())
-
-    if len(cleaned) > max_chars:
-        cleaned = cleaned[:max_chars] + "..."
-
-    return cleaned
-
-
-# =========================================================
-# LANGCHAIN TOOL:
-# SEARCH RECENT RISK NEWS
-# =========================================================
-
-@tool
-def search_risk_news_articles(keyword: str) -> str:
-    """
-    Search Google News RSS for recent macro-risk news.
-
-    Use this tool when the agent needs fresh news about:
-    - geopolitical escalation
-    - oil market shocks
-    - bank liquidity stress
-    - cyberattacks on banks
-
-    Args:
-        keyword:
-            Must be one of:
-            - US military escalation
-            - oil price spike
-            - bank liquidity crisis
-            - cyberattack on banks
-
-    Returns:
-        A formatted list of recent news articles.
-    """
-
-    # -----------------------------------------------------
-    # STEP 1:
-    # VALIDATE KEYWORD
-    # -----------------------------------------------------
-
-    normalized_keyword = normalize_keyword(keyword)
-
-    if not normalized_keyword:
-
-        allowed_keywords = ", ".join(
-            f'"{item}"'
-            for item in RISK_NEWS_KEYWORDS
-        )
-
-        return (
-            f"Unknown keyword: {keyword!r}\n\n"
-            f"Please use exactly one of:\n"
-            f"{allowed_keywords}"
-        )
-
-    # -----------------------------------------------------
-    # STEP 2:
-    # BUILD GOOGLE NEWS RSS URL
-    # -----------------------------------------------------
-
-    rss_url = build_google_news_rss_url(
-        normalized_keyword
-    )
-
-    # -----------------------------------------------------
-    # STEP 3:
-    # FETCH GOOGLE NEWS RSS RESULTS
-    # -----------------------------------------------------
-
-    feed = feedparser.parse(rss_url)
-
-    articles = feed.entries[:8]
-
-    if not articles:
-
-        return (
-            "No recent Google News results returned for: "
-            f"{normalized_keyword}"
-        )
-
-    # -----------------------------------------------------
-    # STEP 4:
-    # FORMAT RESULTS FOR THE AGENT
-    # -----------------------------------------------------
-
-    lines = [
-        f"Recent Google News results for "
-        f"'{normalized_keyword}' "
-        f"({len(articles)} results):\n"
-    ]
-
-    for index, article in enumerate(articles, start=1):
-
-        title = article.get("title", "(no title)")
-        url = article.get("link", "")
-        published_date = article.get("published", "")
-        summary = clean_text(
-            article.get("summary", "")
-        )
-
-        date_text = (
-            f" — {published_date}"
-            if published_date
-            else ""
-        )
-
+def build_llm_context(query: str, results: list[tuple[Document, float]]) -> str:
+    lines = ["CURRENT EVENT:", query, "HISTORICAL ANALOGS:"]
+    for i, (doc, score) in enumerate(results, start=1):
+        meta = doc.metadata
         lines.append(
-            f"{index}. {title}{date_text}\n"
-            f"   URL: {url}\n"
-            f"   Summary: {summary}\n"
+            f"Analog {i} | {meta.get('historical_event', '')} | "
+            f"distance={score:.4f}\n"
+            f"  Transmission: {meta.get('transmission_mechanism', '')}\n"
+            f"  Market: {meta.get('market_impact', '')}\n"
+            f"  Economic: {meta.get('economic_impact', '')}"
         )
-
+    lines.append(
+        "LLM TASK: From these analogs and mechanisms, outline likely market "
+        "and macro impacts for the current event."
+    )
     return "\n".join(lines)
 
 
-# =========================================================
-# OPTIONAL TEST
-# =========================================================
+def format_analog_source_footer(results: list[tuple[Document, float]]) -> str:
+    """Maps Analog 1..N to historical row title + URL so readers need not guess."""
+    lines = ["---", "**Analog sources** (same order as Analog 1, 2, … above):"]
+    for i, (doc, _) in enumerate(results, start=1):
+        meta = doc.metadata or {}
+        title = (meta.get("historical_event") or "").strip() or "(unnamed historical row)"
+        url = (meta.get("url") or "").strip()
+        if url:
+            lines.append(f"- **Analog {i}:** {title} — [{url}]({url})")
+        else:
+            lines.append(f"- **Analog {i}:** {title}")
+    return "\n".join(lines)
+
+
+def _run_impact_assessment(row: dict[str, str], top_k: int) -> str:
+    query = build_query_text(row)
+    if not query:
+        return ""
+    results = retrieve_analogs(query, top_k)
+    if not results:
+        return "No historical analogs retrieved."
+    context = build_llm_context(query, results)
+    llm = ChatOpenAI(model=IMPACT_MODEL, temperature=0)
+    prompt = (
+        "You are a US investment bank early-warning analyst.\n"
+        "Use ONLY the historical analogs and mechanisms below. "
+        "Summarize the most likely market and macroeconomic impacts if the current "
+        "situation parallels those episodes.\n"
+        "Write 5–8 concise bullet points. Whenever you compare to an analog, name the "
+        "**full historical event title** shown next to that analog (do not rely on "
+        "readers knowing what 'Analog 1' means by number alone).\n\n"
+        f"{context}"
+    )
+    message = llm.invoke(prompt)
+    body = (message.content or "").strip()
+    footer = format_analog_source_footer(results)
+    return f"{body}\n\n{footer}".strip()
+
+
+@tool
+def assess_impact_for_signal(
+    chunk: str,
+    article_headlines: str = "",
+    risk_category: str = "",
+    source_url: str = "",
+    top_k: int = TOP_K,
+) -> str:
+    """
+    Embed the surveillance text, find the closest historical shocks in Qdrant (cosine),
+    then return bullet-point impact analysis grounded in those analogs.
+
+    Prefer a substantive **chunk** (evidence passage). If empty, **article_headlines** is used.
+    Optional **risk_category** and **source_url** are only for context in debugging;
+    search uses chunk/headline text only.
+    """
+    row: dict[str, str] = {
+        "chunk": chunk.strip(),
+        "article headlines": (article_headlines or "").strip(),
+        "risk_category": (risk_category or "").strip(),
+        "URL": (source_url or "").strip(),
+    }
+    k = max(1, min(int(top_k), 25))
+    return _run_impact_assessment(row, k)
+
+
+def assess_impact_for_csv_row(row: dict[str, str], top_k: int = TOP_K) -> str:
+    """Same as the tool, but accepts one full CSV row dict (used after writing the CSV)."""
+    return _run_impact_assessment(row, top_k)
+
 
 if __name__ == "__main__":
-
-    print("\nGoogle News RSS Search Tool Ready\n")
-
-    print("Tool name:")
-    print(search_risk_news_articles.name)
-
-    print("\nAllowed keywords:")
-    for keyword in RISK_NEWS_KEYWORDS:
-        print(f"- {keyword}")
-
-    print("\nTest search:")
     print(
-        search_risk_news_articles.invoke(
-            {"keyword": "oil price spike"}
-        )
+        assess_impact_for_signal.invoke({
+            "chunk": "",
+            "article_headlines": (
+                "Oil prices surge after military tensions in the Middle East "
+                "increase inflation concerns."
+            ),
+            "top_k": 3,
+        })
     )

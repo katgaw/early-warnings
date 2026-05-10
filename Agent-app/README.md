@@ -113,7 +113,7 @@ streamlit run streamlit_app.py
 |------|------|
 | `app.py` | Agent + structured extraction → `early_warning_signals.csv` |
 | `rag_tool.py` | Load PDF, chunk, embed, Qdrant, `search_financial_stress_knowledge` |
-| `news_tool.py` | `search_risk_news_articles` (four fixed keyword themes) |
+| `news_tool.py` | Historical analog retrieval + `assess_impact_for_signal` / `assess_impact_for_csv_row` |
 | `streamlit_app.py` | Logo, headings, expanders, risk level badges |
 
 ---
