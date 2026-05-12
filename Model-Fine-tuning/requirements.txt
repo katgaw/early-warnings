@@ -1,0 +1,37 @@
+# Core env
+python-dotenv
+nest-asyncio
+ipykernel
+
+# LangChain stack (matches notebook pip cells)
+langchain
+langchain-core
+langchain-community
+langchain-openai
+langchain-huggingface
+langchain-text-splitters
+
+# OpenAI SDK (AzureOpenAI in hybrid notebook)
+openai
+
+# Docs / loaders / vector store
+pymupdf
+faiss-cpu
+beautifulsoup4
+lxml
+python-pptx==1.0.2
+nltk==3.9.1
+
+# Embeddings / training
+sentence-transformers
+torch
+accelerate
+datasets
+pyarrow==19.0.0
+
+# Hugging Face (notebook_login)
+huggingface-hub
+
+# Data / UX
+pandas
+tqdm

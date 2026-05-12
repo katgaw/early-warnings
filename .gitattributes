@@ -1,0 +1,2 @@
+# Sentence Transformers / HF-style weights (Model-Fine-tuning)
+*.safetensors filter=lfs diff=lfs merge=lfs -text
